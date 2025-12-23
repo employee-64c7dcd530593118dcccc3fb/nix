@@ -396,6 +396,41 @@ Goal::Co DerivationBuildingGoal::tryToBuild()
                 externalBuilder = settings.findExternalDerivationBuilderIfSupported(*drv);
 
                 if (!externalBuilder && !drvOptions.canBuildLocally(worker.store, *drv)) {
+                    // Before failing due to architecture mismatch, try substitution
+                    // Release locks first to avoid deadlocks
+                    outputLocks.unlock();
+
+                    // Only try substitution if it's enabled
+                    if (settings.useSubstitutes) {
+                        Goals substitutionGoals;
+
+                        // Create substitution goals for all outputs
+                        for (auto & [outputName, output] : drv->outputs) {
+                            auto outputPath = output.path(worker.store, drv->name, outputName);
+                            if (!outputPath || worker.store.isValidPath(*outputPath)) {
+                                continue; // Skip if path is invalid or already valid
+                            }
+                            substitutionGoals.insert(upcast_goal(worker.makePathSubstitutionGoal(*outputPath)));
+                        }
+
+                        // If we have substitution goals, try them
+                        if (!substitutionGoals.empty()) {
+                            debug("Cannot build locally due to architecture mismatch, trying substitution");
+                            co_await await(std::move(substitutionGoals));
+
+                            // Check if all outputs are now valid after substitution
+                            auto [allValid, validOutputs] = checkPathValidity(initialOutputs);
+                            if (allValid) {
+                                debug("All outputs were successfully substituted");
+                                co_return doneSuccess(BuildResult::Success::Substituted, std::move(validOutputs));
+                            }
+
+                            // Reset failure counters for the original error message
+                            nrFailed = nrNoSubstituters = 0;
+                        }
+                    }
+
+                    // Substitution failed or wasn't possible - prepare error message
                     auto msg =
                         fmt("Cannot build '%s'.\n"
                             "Reason: " ANSI_RED "required system or feature not available" ANSI_NORMAL
